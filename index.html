@@ -292,7 +292,8 @@ uniform vec2 uRes;
 uniform vec3 uCP, uCF, uCR, uCU;
 uniform float uTanH, uAsp, uPix, uTime, uWind, uTop, uMouth;
 uniform vec3 uSun, uM1, uM2;
-uniform sampler2D uH, uN, uD;
+uniform sampler2D uH, uN, uD, uB;
+uniform vec3 uBO;
 uniform vec4 uW[${WN}];
 uniform int uWN;
 uniform vec4 uWB;
@@ -303,7 +304,13 @@ out vec4 oC;
 
 float hS(vec2 p, float l){ return textureLod(uH, p*IT, l).r; }
 float hD(vec2 p){ return textureLod(uD, p*IT, 0.).r; }
-float hT(vec2 p, float l){ return hS(p,l) + hD(p); }
+float hB(vec2 p){
+  if (uBO.z < 0.5) return 0.;
+  vec2 uv = (p - uBO.xy)/256.;
+  if (uv.x < 0. || uv.y < 0. || uv.x > 1. || uv.y > 1.) return 0.;
+  return textureLod(uB, uv, 0.).r;
+}
+float hT(vec2 p, float l){ return hS(p,l) + hD(p) + hB(p); }
 
 float march(vec3 ro, vec3 rd, out bool hit){
   hit = false;
@@ -457,6 +464,7 @@ float hitWorm(vec3 ro, vec3 rd, float tmax, out int idx){
   for (int i=0;i<${WN};i++){
     if (i >= uWN) break;
     vec4 s = uW[i];
+    if (s.w <= 0.) continue;
     vec3 o2 = ro - s.xyz; float bb = dot(o2, rd); float cc = dot(o2,o2) - s.w*s.w; float hh = bb*bb - cc;
     if (hh > 0.){ float tt = -bb - sqrt(hh); if (tt > 0. && tt < best){ best = tt; idx = i; } }
   }
@@ -477,6 +485,7 @@ float objShadow(vec3 P){
     for (int i=0;i<${WN};i++){
       if (i >= uWN) break;
       vec4 sp = uW[i];
+      if (sp.w <= 0.) continue;
       vec3 o2 = P - sp.xyz; float bb = dot(o2, uSun); float cc = dot(o2,o2) - sp.w*sp.w;
       if (bb < 0. && bb*bb - cc > 0.){ s = 0.; break; }
     }
@@ -496,10 +505,12 @@ vec3 shadeTerrain(vec3 P, float t, ivec2 ip, float b0, float b1, float b2){
   vec2 grad = -g/ny;
   vec2 dd = textureLod(uD, uv, 0.).rg;
   float mark = clamp(dd.g, 0., 1.);
+  float bl = hB(P.xz);
+  dd.r += bl;
   if (abs(dd.r) > 0.002 || mark > 0.002){
     float e = 2.0;
-    float gx = hD(P.xz+vec2(e,0.)) - hD(P.xz-vec2(e,0.));
-    float gz = hD(P.xz+vec2(0.,e)) - hD(P.xz-vec2(0.,e));
+    float gx = hD(P.xz+vec2(e,0.)) - hD(P.xz-vec2(e,0.)) + hB(P.xz+vec2(e,0.)) - hB(P.xz-vec2(e,0.));
+    float gz = hD(P.xz+vec2(0.,e)) - hD(P.xz-vec2(0.,e)) + hB(P.xz+vec2(0.,e)) - hB(P.xz-vec2(0.,e));
     grad += vec2(gx, gz)/(2.*e);
   }
   vec3 n = normalize(vec3(-grad.x, 1., -grad.y));
@@ -714,12 +725,16 @@ void main(){
   vec2 uv = aP.xz/${T.toFixed(1)};
   float sh = textureLod(uN, uv, 0.).b*8.; float h = textureLod(uH, uv, 0.).r;
   int ci = int(aC.x + 0.5);
-  if (aP.y - h < sh - 0.1) ci = max(ci - 4, 1);
+  if (ci < 10 && aP.y - h < sh - 0.1) ci = max(ci - 4, 1);
   vCol = ci; vA = aC.y;
 }`;
 const FS_PART = HDR + `
 flat in int vCol; in float vA; out vec4 o;
-void main(){ if (bayer(ivec2(gl_FragCoord.xy)) >= vA) discard; o = vec4(SAND[clamp(vCol,0,9)], 0.); }`;
+void main(){
+  if (bayer(ivec2(gl_FragCoord.xy)) >= vA) discard;
+  vec3 c = vCol < 10 ? SAND[clamp(vCol,0,9)] : (vCol < 13 ? METAL[vCol-10] : CLOAK[0]);
+  o = vec4(c, 0.);
+}`;
 
 const FS_POST = HDR + `
 uniform sampler2D uC, uZ; uniform vec2 uRes; uniform float uTime;
@@ -772,6 +787,13 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
 
+const texB = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, texB);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, 128, 128, 0, gl.RED, gl.FLOAT, new Float32Array(128*128));
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 let heights = null, nrmRGBA = null, maxH = 40;
 
 function uploadTerrain(){
@@ -829,7 +851,8 @@ let dpr = 1;
 function resize(){
   dpr = window.devicePixelRatio || 1;
   const sw = Math.max(1, Math.round(innerWidth*dpr)), sh = Math.max(1, Math.round(innerHeight*dpr));
-  let base = Math.max(1, Math.round(sh/340));
+  const rows = (window.matchMedia && matchMedia('(pointer: coarse)').matches) ? 250 : 340;
+  let base = Math.max(1, Math.round(sh/rows));
   pixScale = base + resDrop;
   rw = Math.ceil(sw/pixScale); rh = Math.ceil(sh/pixScale);
   glc.width = rw; glc.height = rh;
@@ -850,7 +873,7 @@ const P = {
   life:new Float32Array(PMAX), max:new Float32Array(PMAX), size:new Float32Array(PMAX),
   col:new Float32Array(PMAX), a:new Float32Array(PMAX), drag:new Float32Array(PMAX), grav:new Float32Array(PMAX), n:0
 };
-const pBuf = new Float32Array(PMAX*6);
+const pBuf = new Float32Array((PMAX + 2000)*6);
 const pVBO = gl.createBuffer();
 const pVAO = gl.createVertexArray();
 gl.bindVertexArray(pVAO);
@@ -892,7 +915,11 @@ function updateParticles(dt){
 // ════════════════════════════════════════════════════════════════════
 //  Height queries (CPU mirror of the GPU fields)
 // ════════════════════════════════════════════════════════════════════
-const furrow = new Float32Array(DN*DN), mark = new Float32Array(DN*DN), bulge = new Float32Array(DN*DN);
+const furrow = new Float32Array(DN*DN), mark = new Float32Array(DN*DN);
+const rowAny = new Uint8Array(DN), rowLast = new Float32Array(DN); let decayRow = 0;
+const BL = 128;                       // worm-centred bulge window: 128 cells of 2 m
+const bulgeL = new Float32Array(BL*BL), blHs = new Float32Array(BL*BL), blMark = new Int32Array(BL*BL);
+let blOx = 0, blOz = 0, blOn = false, blStamp = 0;
 let rockMask = null;
 function hS(x, z){
   const fx = x*2 - 0.5, fz = z*2 - 0.5;
@@ -905,16 +932,21 @@ function hDsp(x, z){
   const fx = x/DC - 0.5, fz = z/DC - 0.5;
   const ix = Math.floor(fx), iz = Math.floor(fz), tx = fx - ix, tz = fz - iz;
   const x0 = ix & 511, x1 = (ix+1) & 511, z0 = (iz & 511)*512, z1 = ((iz+1) & 511)*512;
-  const a = furrow[z0+x0]+bulge[z0+x0], b = furrow[z0+x1]+bulge[z0+x1], c = furrow[z1+x0]+bulge[z1+x0], d = furrow[z1+x1]+bulge[z1+x1];
-  return (a*(1-tx) + b*tx)*(1-tz) + (c*(1-tx) + d*tx)*tz;
+  return (furrow[z0+x0]*(1-tx) + furrow[z0+x1]*tx)*(1-tz) + (furrow[z1+x0]*(1-tx) + furrow[z1+x1]*tx)*tz;
 }
-function hAt(x, z){ return hS(x, z) + hDsp(x, z); }
+function hFur(x, z){ return hDsp(x, z); }
+function hBul(x, z){
+  if (!blOn) return 0;
+  const fx = (x - blOx)/DC - 0.5, fz = (z - blOz)/DC - 0.5;
+  if (fx < 0 || fz < 0 || fx >= BL - 1 || fz >= BL - 1) return 0;
+  const ix = Math.floor(fx), iz = Math.floor(fz), tx = fx - ix, tz = fz - iz, o = iz*BL + ix;
+  return (bulgeL[o]*(1-tx) + bulgeL[o+1]*tx)*(1-tz) + (bulgeL[o+BL]*(1-tx) + bulgeL[o+BL+1]*tx)*tz;
+}
+function hAt(x, z){ return hS(x, z) + hDsp(x, z) + hBul(x, z); }
 function gradAt(x, z){ const e = 0.5; return [(hAt(x+e,z) - hAt(x-e,z))/(2*e), (hAt(x,z+e) - hAt(x,z-e))/(2*e)]; }
 function rockAt(x, z){ const i = Math.floor(x*2) & 2047, j = Math.floor(z*2) & 2047; return rockMask[j*2048+i]/255; }
 
 // ---------- displacement texture maintenance ----------
-let bulgeRects = [];
-let furrowAny = false, decayT = 0;
 const upTmp = new Float32Array(DN*DN*2);
 function uploadRect(i0, j0, w, h){
   gl.bindTexture(gl.TEXTURE_2D, texD);
@@ -927,12 +959,11 @@ function uploadRect(i0, j0, w, h){
   for (const [zx, zl] of zs) for (const [xx, xl] of xs){
     let o = 0;
     for (let j = zx; j < zx+zl; j++) for (let i = xx; i < xx+xl; i++){
-      const k = j*DN + i; upTmp[o++] = furrow[k] + bulge[k]; upTmp[o++] = mark[k];
+      const k = j*DN + i; upTmp[o++] = furrow[k]; upTmp[o++] = mark[k];
     }
     gl.texSubImage2D(gl.TEXTURE_2D, 0, xx, zx, xl, zl, gl.RG, gl.FLOAT, upTmp.subarray(0, o));
   }
 }
-function uploadAllDisp(){ uploadRect(0, 0, DN, DN); }
 const bump = x => x < 1 ? (1 - x*x)*(1 - x*x) : 0;
 
 // ════════════════════════════════════════════════════════════════════
@@ -951,11 +982,10 @@ const pl = {
   x:0, y:0, z:0, vx:0, vy:0, vz:0, svx:0, svz:0, yaw:0,
   state:'ground', timer:0, sliding:false, slideFx:0,
   stepT:0, foot:0, stepF:1, stride:0, phase:0, lean:0, crouch:0, arms:0, plant:0, roll:0, drag:0,
-  mountFrom:null, knockCd:0, flap:0, lastLand:0
+  knockCd:0, flap:0, lastLand:0
 };
 let th = null;     // thumper
 let worm = null;
-let mw = null;     // mount window
 const fp = new Float32Array(48*4).fill(-1000); let fpI = 0;
 const emitters = [];
 
@@ -1186,7 +1216,7 @@ function rotateCam(dx, dy){
 //  Actions
 // ════════════════════════════════════════════════════════════════════
 function doAction(){
-  if (mw && pl.state !== 'ride' && pl.state !== 'mounting'){ mountWorm(); return; }
+  if (hookTarget >= 0 && worm && canHook()){ throwHooks(); return; }
   if (pl.state === 'ground') { pl.state = 'plant'; pl.timer = 0; pl.vx *= 0.2; pl.vz *= 0.2; pl.svx *= 0.2; pl.svz *= 0.2; }
 }
 function doJump(){
@@ -1197,12 +1227,11 @@ function doJump(){
 function plantThumper(){
   const fx = Math.sin(pl.yaw), fz = Math.cos(pl.yaw);
   const x = pl.x + fx*0.75, z = pl.z + fz*0.75;
-  const had = th && th.active;
-  th = { x, z, y: hS(x, z), t: 0, drive: 0, active: false, life: 62, wormAt: rr(15, 30), called: false, lift: 0, beat: 0, light: 0, gone: false };
+  th = { x, z, y: hS(x, z), t: 0, drive: 0, active: false, life: 62, wormAt: rr(0.8, 1.2), arriveAt: rr(6.8, 8.6), called: false, lift: 0, beat: 0, light: 0, gone: false, mode: thumperMode(x, z) };
   sfx.plant();
   for (let i = 0; i < 18; i++){ const a = rnd()*6.283; spawnP(x, th.y + 0.05, z, Math.cos(a)*rr(0.6,1.8), rr(0.4,1.6), Math.sin(a)*rr(0.6,1.8), rr(0.4,0.8), rr(0.08,0.16), 7 + (rnd()*2|0), 0.8, 2.5, 4); }
   if (worm && worm.state === 'approach') retargetWorm();
-  else if (had) showMsg('Le marteleur précédent se tait.', 2.5);
+  showMsg(th.mode === 'h' ? 'Sommet de dune : le ver viendra en surface.' : 'Creux des dunes : le ver surgira par en dessous.', 3.5);
 }
 
 function knockback(fromX, fromZ){
@@ -1210,7 +1239,6 @@ function knockback(fromX, fromZ){
   let dx = pl.x - fromX, dz = pl.z - fromZ; const l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;
   pl.vx = dx*9.5; pl.vz = dz*9.5; pl.vy = 8.5; pl.svx = pl.svz = 0;
   pl.state = 'tumble'; pl.timer = 0; pl.knockCd = 2.5;
-  mw = null;
   cam.shake = Math.max(cam.shake, 1.2);
   sfx.blast();
   for (let i = 0; i < 260; i++){
@@ -1219,26 +1247,6 @@ function knockback(fromX, fromZ){
       dx*rr(4,14) + Math.cos(a)*rr(0,3), rr(3,13), dz*rr(4,14) + Math.sin(a)*rr(0,3), rr(0.8,2.2), rr(0.08,0.35), 5 + (rnd()*5|0), 0.9, 0.9, 9);
   }
   showMsg('Le sable vous a rejeté. Plantez un nouveau marteleur.', 4);
-}
-
-function mountWorm(){
-  if (!worm || !mw) return;
-  mw = null;
-  pl.state = 'mounting'; pl.timer = 0;
-  pl.mountFrom = [pl.x, pl.y, pl.z];
-  worm.state = 'ride';
-  worm.heading = Math.atan2(worm.dirx, worm.dirz);
-  worm.turn = 0; worm.vy = 0;
-  slowmo = 1.0;
-  cam.shake = Math.max(cam.shake, 1.4);
-  cam.swing = 1;
-  sfx.whoosh(); sfx.roar(0.7);
-  for (let i = 0; i < 420; i++){
-    const a = rnd()*6.283, r = rnd()*5;
-    spawnP(pl.x + Math.cos(a)*r, pl.y + rnd()*2, pl.z + Math.sin(a)*r,
-      Math.cos(a)*rr(2,9), rr(4,18), Math.sin(a)*rr(2,9), rr(1,2.6), rr(0.1,0.4), 5 + (rnd()*5|0), 0.95, 0.8, 9);
-  }
-  if (th){ th.active = false; }
 }
 
 function dismount(){
@@ -1269,10 +1277,16 @@ function stepEvent(run){
   pl.foot ^= 1;
   pl.stepF = rnd() < 0.13 ? rr(1.4, 1.75) : rr(0.72, 1.28);
   const side = pl.foot ? 1 : -1;
-  const rx = -Math.cos(pl.yaw), rz = Math.sin(pl.yaw);
-  const o = fpI*4;
-  fp[o] = pl.x + rx*0.13*side; fp[o+1] = pl.z + rz*0.13*side; fp[o+2] = pl.yaw; fp[o+3] = time;
-  fpI = (fpI + 1) % 48;
+  const rx = -Math.cos(pl.yaw), rz = Math.sin(pl.yaw), fx = Math.sin(pl.yaw), fz = Math.cos(pl.yaw);
+  // irregular gait in loose sand: prints wander sideways, twist and sometimes double up
+  const prints = rnd() < 0.15 ? 2 : 1;
+  for (let n = 0; n < prints; n++){
+    const lat = side*rr(0.06, 0.34) + rr(-0.12, 0.12), fwd = rr(-0.22, 0.22) - n*rr(0.15, 0.3);
+    const o = fpI*4;
+    fp[o] = pl.x + rx*lat + fx*fwd; fp[o+1] = pl.z + rz*lat + fz*fwd;
+    fp[o+2] = pl.yaw + rr(-0.6, 0.6) + side*0.15; fp[o+3] = time - rr(0, 4);
+    fpI = (fpI + 1) % 48;
+  }
   kick(run ? 7 : 4, run ? 1.2 : 0.8);
   sfx.step(run ? 1 : 0.7);
 }
@@ -1281,14 +1295,20 @@ function updatePlayer(dt){
   pl.knockCd = Math.max(0, pl.knockCd - dt);
   pl.flap += dt;
   if (pl.state === 'ride'){ rideFollow(dt); return; }
-  if (pl.state === 'mounting'){
+  if (pl.state === 'hooking'){ pl.stride = 0; pl.roll = 0; pl.plant = 0; updateHook(dt); return; }
+  if (pl.state === 'swallowed'){
     pl.timer += dt;
-    const e = clamp(pl.timer/0.75, 0, 1), k = e*e*(3 - 2*e);
-    const tp = wormBack();
-    pl.x = lerp(pl.mountFrom[0], tp[0], k); pl.z = lerp(pl.mountFrom[2], tp[2], k);
-    pl.y = lerp(pl.mountFrom[1], tp[1], k) + Math.sin(Math.PI*e)*3.5;
-    pl.arms = 1; pl.crouch = 0.3; pl.stride = 0; pl.roll = 0;
-    if (e >= 1){ pl.state = 'ride'; showMsg('Vous chevauchez le géant.', 2.5); }
+    pl.x = pl.swx; pl.z = pl.swz; pl.y = hAt(pl.x, pl.z);
+    if (pl.timer > 2.6){
+      // spat back out onto the sand
+      const a = rnd()*6.283;
+      pl.y += 2; pl.vx = Math.cos(a)*9; pl.vz = Math.sin(a)*9; pl.vy = 11;
+      pl.state = 'tumble'; pl.timer = 0; pl.knockCd = 2;
+      cam.shake = Math.max(cam.shake, 0.9);
+      sfx.blast();
+      for (let i = 0; i < 300; i++){ const b = rnd()*6.283; spawnP(pl.x, pl.y, pl.z, Math.cos(b)*rr(1,8), rr(4,16), Math.sin(b)*rr(1,8), rr(0.8,2), rr(0.1,0.45), 5 + (rnd()*5|0), 0.9, 0.8, 9); }
+      showMsg('Le ver vous a recraché. Plantez un nouveau marteleur.', 4);
+    }
     return;
   }
   // input
@@ -1392,12 +1412,13 @@ function updatePlayer(dt){
   pl.drag = lerp(pl.drag, clamp(hs/6.5, 0, 1)*0.35, damp(4, dt));
 }
 function wormBack(){
+  if (!worm) return [pl.x, pl.y, pl.z];
   const s = worm.sph, i = 3*4;
   const x = s[i], y = s[i+1], z = s[i+2], r = s[i+3];
   return [x, Math.max(y + r*0.93, hAt(x, z) + 0.1), z];
 }
 function rideFollow(dt){
-  if (!worm){ pl.state = 'air'; return; }
+  if (!worm || worm.state !== 'ride'){ pl.state = 'air'; return; }
   const b = wormBack();
   pl.x = b[0]; pl.y = b[1]; pl.z = b[2];
   pl.vx = worm.dirx*worm.speed; pl.vz = worm.dirz*worm.speed; pl.vy = 0;
@@ -1448,11 +1469,20 @@ function wormRadius(i){
   const t = Math.max(0, (i - 20)/(WN - 1 - 20));
   return WR*(1 - 0.7*t*t)*(i % 2 ? 0.95 : 1);
 }
+// Relief around a point decides how the worm comes: on a big dune it surfaces and
+// arrives horizontally (mountable); low down it strikes vertically from below.
+function thumperMode(x, z){
+  const h0 = hS(x, z); let mn = h0, mx = h0;
+  for (const r of [8, 16, 26, 38, 50]) for (let k = 0; k < 12; k++){
+    const a = k/12*6.283, h = hS(x + Math.cos(a)*r, z + Math.sin(a)*r);
+    if (h < mn) mn = h; if (h > mx) mx = h;
+  }
+  return (h0 - mn > 5 && mx - mn > 7) ? 'h' : 'v';
+}
 function buildPath(w, sx, sz, dirx, dirz, ex, ez, curve){
   const L0 = Math.hypot(ex - sx, ez - sz);
   const px = -dirz, pz = dirx;
   const c1x = sx + dirx*L0*0.45 + px*curve, c1z = sz + dirz*L0*0.45 + pz*curve;
-  const pts = [];
   let lx = sx, lz = sz, acc = 0;
   const raw = [[sx, sz, 0]];
   for (let i = 1; i <= 800; i++){
@@ -1460,7 +1490,7 @@ function buildPath(w, sx, sz, dirx, dirz, ex, ez, curve){
     const x = u*u*sx + 2*u*t*c1x + t*t*ex, z = u*u*sz + 2*u*t*c1z + t*t*ez;
     acc += Math.hypot(x - lx, z - lz); raw.push([x, z, acc]); lx = x; lz = z;
   }
-  const len = Math.floor(acc);
+  const len = Math.max(2, Math.floor(acc));
   const PX = new Float32Array(len + 1), PZ = new Float32Array(len + 1), PH = new Float32Array(len + 1);
   let j = 0;
   for (let s = 0; s <= len; s++){
@@ -1468,80 +1498,94 @@ function buildPath(w, sx, sz, dirx, dirz, ex, ez, curve){
     const a = raw[j], b = raw[j+1], f = clamp((s - a[2])/Math.max(1e-6, b[2] - a[2]), 0, 1);
     PX[s] = lerp(a[0], b[0], f); PZ[s] = lerp(a[1], b[1], f); PH[s] = hS(PX[s], PZ[s]);
   }
-  // crest crossings
+  // crests the worm will pass under: they tremble and stream sand as a cue
   const cross = [];
-  for (let s = 30; s < len - 22; s++){
+  for (let s = 20; s < len - 20; s++){
     const h = PH[s];
     let isMax = true;
     for (let k = -10; k <= 10; k++){ if (k && PH[clamp(s+k,0,len)] > h){ isMax = false; break; } }
     if (!isMax) continue;
     let m1 = h, m2 = h;
-    for (let k = 1; k <= 40; k++){ m1 = Math.min(m1, PH[clamp(s-k,0,len)]); }
-    for (let k = 1; k <= 30; k++){ m2 = Math.min(m2, PH[clamp(s+k,0,len)]); }
-    if (h - m1 > 2.2 && h - m2 > 1.5 && rockAt(PX[s], PZ[s]) < 0.2) cross.push({ s, x: PX[s], z: PZ[s], h, done: false });
+    for (let k = 1; k <= 40; k++) m1 = Math.min(m1, PH[clamp(s-k,0,len)]);
+    for (let k = 1; k <= 30; k++) m2 = Math.min(m2, PH[clamp(s+k,0,len)]);
+    if (h - m1 > 2.2 && h - m2 > 1.5) cross.push({ s, x: PX[s], z: PZ[s], h });
     s += 10;
   }
-  // target spine height
-  const base = new Float32Array(len + 1), YT = new Float32Array(len + 1);
+  // spine height along the path
+  const YT = new Float32Array(len + 1);
   for (let s = 0; s <= len; s++){
-    let m = 1e9; for (let k = -12; k <= 12; k += 2) m = Math.min(m, PH[clamp(s+k,0,len)]);
-    base[s] = m - WR - 1.4;
-  }
-  for (let s = 0; s <= len; s++){
-    let y = base[s];
-    for (const c of cross){ const d = (s - c.s)/14; y = Math.max(y, c.h + 2.6 - WR - d*d*9); }
-    const near = ss(len - 30, len - 4, s);
-    YT[s] = lerp(y, PH[s] - WR - 1.2, near);
+    let m = 1e9, a = 0, n = 0;
+    for (let k = -12; k <= 12; k += 2){ const h = PH[clamp(s+k,0,len)]; m = Math.min(m, h); if (Math.abs(k) <= 8){ a += h; n++; } }
+    let y = m - WR - 2.6;                                         // buried
+    if (w.mode === 'h') y = lerp(y, a/n - WR*0.05, ss(len - 85, len - 55, s));   // half out of the sand
+    else y = lerp(y, PH[len] - WR - 24, ss(len - 70, len - 4, s));               // dive under the thumper
+    YT[s] = y;
   }
   for (let pass = 0; pass < 2; pass++){
     const cp = YT.slice();
     for (let s = 0; s <= len; s++){ let a = 0, n = 0; for (let k = -3; k <= 3; k++){ const q = s + k; if (q >= 0 && q <= len){ a += cp[q]; n++; } } YT[s] = a/n; }
   }
-  for (const c of cross) YT[c.s] = Math.max(YT[c.s], c.h + 2.2 - WR);
-  w.PX = PX; w.PZ = PZ; w.PH = PH; w.YT = YT; w.len = len; w.cross = cross; w.s = 0;
+  let rocks = 0;
+  for (let s = 0; s <= len; s += 4) if (rockAt(PX[s], PZ[s]) > 0.3) rocks++;
+  w.PX = PX; w.PZ = PZ; w.PH = PH; w.YT = YT; w.len = len; w.cross = cross; w.s = 0; w.rocks = rocks;
 }
 function pathAt(w, s){
   const i = clamp(Math.floor(s), 0, w.len - 1), f = clamp(s - i, 0, 1);
   return [lerp(w.PX[i], w.PX[i+1], f), lerp(w.YT[i], w.YT[i+1], f), lerp(w.PZ[i], w.PZ[i+1], f)];
 }
+function newWorm(mode){
+  return { state:'approach', mode, speed: 13, trail: [], sph: new Float32Array(WN*4), rsph: new Float32Array(WN*4), exp: new Uint8Array(WN),
+    rN: 0, dirx: 0, dirz: 1, hx: 0, hy: 0, hz: 0, jetT: 1.5, mouth: 0, heading: 0, turn: 0, vy: 0, dt: 0, st: 0, prog: 0, life: 0, hissT: 0,
+    cx: 0, cz: 0, bx: 0, by: -1e4, bz: 0, br: 1, ate: false };
+}
 function spawnWorm(){
   if (!th) return;
-  const w = { state:'approach', speed: 13, trail: [], sph: new Float32Array(WN*4), dirx: 0, dirz: 0, hx: 0, hy: 0, hz: 0,
-    jetT: 1.5, mouth: 0, heading: 0, turn: 0, vy: 0, dt: 0, st: 0, prog: 0, life: 0, hissT: 0 };
-  let sx, sz, dx, dz, best = null;
-  for (let tries = 0; tries < 12; tries++){
-    const ang = (tries < 8 ? (rnd() < 0.5 ? 0 : Math.PI) + rr(-0.95, 0.95) : rnd()*6.283), D = rr(330, 390);
+  const w = newWorm(th.mode || 'v');
+  let best = null;
+  for (let tries = 0; tries < 8; tries++){
+    const ang = (tries < 6 ? (rnd() < 0.5 ? 0 : Math.PI) + rr(-0.95, 0.95) : rnd()*6.283), D = w.mode === 'h' ? rr(125, 145) : rr(150, 175);
     const x = th.x + Math.cos(ang)*D, z = th.z + Math.sin(ang)*D;
     let ex = th.x - x, ez = th.z - z; const l = Math.hypot(ex, ez); ex /= l; ez /= l;
-    const curve = (rnd() < 0.5 ? -1 : 1)*rr(40, 90);
+    const curve = (rnd() < 0.5 ? -1 : 1)*rr(15, 35);
     buildPath(w, x, z, ex, ez, th.x, th.z, curve);
-    const n = w.cross.length;
-    if (!best || n > best.n) best = { n, x, z, ex, ez, curve };
-    if (n >= 3) break;
+    const score = Math.min(w.cross.length, 3) - w.rocks*2;
+    if (!best || score > best.score) best = { score, x, z, ex, ez, curve };
+    if (w.rocks === 0 && w.cross.length >= 2) break;
   }
-  sx = best.x; sz = best.z; dx = best.ex; dz = best.ez;
-  buildPath(w, sx, sz, dx, dz, th.x, th.z, best.curve);
-  w.dirx = dx; w.dirz = dz; w.hx = sx; w.hz = sz;
-  const p0 = pathAt(w, 0);
-  w.hy = p0[1];
+  buildPath(w, best.x, best.z, best.ex, best.ez, th.x, th.z, best.curve);
+  w.dirx = best.ex; w.dirz = best.ez; w.hx = best.x; w.hz = best.z; w.hy = w.YT[0];
+  setTiming(w, Math.max(4.5, (th.arriveAt || 8) - th.t));
   for (let k = 160; k > 0; k -= 0.6){
-    const x = sx - dx*k, z = sz - dz*k;
+    const x = best.x - best.ex*k, z = best.z - best.ez*k;
     w.trail.push({ x, y: hS(x, z) - WR - 10 - k*0.05, z });
   }
   worm = w;
   wormSpheres();
 }
+// Speeds chosen so the worm reaches the thumper after T seconds. On a big dune the last
+// 70 m are travelled surfaced and slowing down, so there is time to throw the hooks.
+const SURF = 70;
+function surfSpeed(w){ return lerp(19, 9, ss(w.len - SURF, w.len, w.s)); }
+function setTiming(w, T){
+  if (w.mode === 'h'){
+    const surfLen = Math.min(SURF, w.len*0.6), surfTime = surfLen/14;
+    w.vU = clamp((w.len - surfLen)/Math.max(1, T - surfTime), 12, 34);
+  } else w.vU = clamp(w.len/T, 12, 34);
+}
 function retargetWorm(){
   const w = worm;
   const curY = w.hy;
+  w.mode = th.mode;
   buildPath(w, w.hx, w.hz, w.dirx, w.dirz, th.x, th.z, rr(-40, 40));
   for (let s = 0; s <= Math.min(w.len, 30); s++) w.YT[s] = lerp(curY, w.YT[s], ss(0, 30, s));
+  setTiming(w, rr(5, 7));
 }
 function pushTrail(w){
-  const t = w.trail, last = t[t.length - 1];
+  const t = w.trail;
+  if (w.retract){ while (t.length > 2 && t[t.length - 1].y > w.hy) t.pop(); return; }
+  const last = t[t.length - 1];
   if (!last || Math.hypot(w.hx - last.x, w.hy - last.y, w.hz - last.z) > 0.6) t.push({ x: w.hx, y: w.hy, z: w.hz });
   const maxLen = WN*WSP + 30;
-  // trim
   let acc = 0;
   for (let i = t.length - 1; i > 0; i--){
     acc += Math.hypot(t[i].x - t[i-1].x, t[i].y - t[i-1].y, t[i].z - t[i-1].z);
@@ -1550,10 +1594,9 @@ function pushTrail(w){
 }
 function wormSpheres(){
   const w = worm, t = w.trail, S = w.sph;
-  let px = w.hx, py = w.hy, pz = w.hz;
-  S[0] = px; S[1] = py; S[2] = pz; S[3] = wormRadius(0);
+  S[0] = w.hx; S[1] = w.hy; S[2] = w.hz; S[3] = wormRadius(0);
   let i = t.length - 1, acc = 0, k = 1;
-  let ax = px, ay = py, az = pz;
+  let ax = w.hx, ay = w.hy, az = w.hz;
   while (k < WN && i >= 0){
     const b = t[i];
     const seg = Math.hypot(b.x - ax, b.y - ay, b.z - az);
@@ -1565,12 +1608,23 @@ function wormSpheres(){
     } else { acc += seg; ax = b.x; ay = b.y; az = b.z; i--; }
   }
   while (k < WN){ S[k*4] = ax; S[k*4+1] = ay - 30; S[k*4+2] = az; S[k*4+3] = wormRadius(k); k++; }
-  let cx = 0, cy = 0, cz = 0;
-  for (let j = 0; j < WN; j++){ cx += S[j*4]; cy += S[j*4+1]; cz += S[j*4+2]; }
-  cx /= WN; cy /= WN; cz /= WN;
-  let r = 0;
-  for (let j = 0; j < WN; j++) r = Math.max(r, Math.hypot(S[j*4] - cx, S[j*4+1] - cy, S[j*4+2] - cz) + S[j*4+3]);
-  w.bx = cx; w.by = cy; w.bz = cz; w.br = r;
+  // which spheres break the surface (only those are sent to the renderer)
+  const R = w.rsph; R.set(S);
+  let cx = 0, cz = 0, ex = 0, ey = 0, ez = 0, n = 0;
+  for (let j = 0; j < WN; j++){
+    cx += S[j*4]; cz += S[j*4+2];
+    const top = S[j*4+1] + S[j*4+3];
+    const e = top > hS(S[j*4], S[j*4+2]) - 0.4;
+    w.exp[j] = e ? 1 : 0;
+    if (e){ ex += S[j*4]; ey += S[j*4+1]; ez += S[j*4+2]; n++; } else R[j*4+3] = 0;
+  }
+  w.cx = cx/WN; w.cz = cz/WN; w.rN = n;
+  if (n){
+    ex /= n; ey /= n; ez /= n;
+    let r = 0;
+    for (let j = 0; j < WN; j++) if (w.exp[j]) r = Math.max(r, Math.hypot(S[j*4] - ex, S[j*4+1] - ey, S[j*4+2] - ez) + S[j*4+3]);
+    w.bx = ex; w.by = ey; w.bz = ez; w.br = r;
+  }
 }
 function wormDist(x, z){
   if (!worm) return 1e9;
@@ -1578,6 +1632,7 @@ function wormDist(x, z){
   for (let j = 0; j < WN; j += 2) d = Math.min(d, Math.hypot(S[j*4] - x, S[j*4+2] - z));
   return d;
 }
+function headUnder(w){ return w.hy + WR < hS(w.hx, w.hz) - 1; }
 function spawnJet(x, z, sc, silent){
   const y0 = hAt(x, z);
   const n = Math.floor(320*sc);
@@ -1594,21 +1649,58 @@ function spawnJet(x, z, sc, silent){
   }
   if (!silent) sfx.jet(Math.max(0.12, distVol(x, z, 520))*Math.min(1, sc));
 }
-function geyser(x, z){
-  const y0 = hAt(x, z);
-  for (let i = 0; i < 900; i++){
-    const a = rnd()*6.283, r = rnd()*7;
-    spawnP(x + Math.cos(a)*r, y0 + rnd()*3, z + Math.sin(a)*r,
-      Math.cos(a)*rr(1,7), rr(14, 44), Math.sin(a)*rr(1,7),
-      rr(2.0, 4.5), rr(0.3, 1.4), 4 + (rnd()*6|0), 0.95, 0.3, 9.8);
+function sandWalls(w, rate, k0, k1){
+  const S = w.sph;
+  for (let side = -1; side <= 1; side += 2){
+    const rx = -w.dirz*side, rz = w.dirx*side;
+    for (let i = 0; i < rate; i++){
+      const k = k0 + (rnd()*(k1 - k0 + 1)|0);
+      if (!w.exp[k]) continue;
+      const x = S[k*4] + rx*S[k*4+3]*1.05, z = S[k*4+2] + rz*S[k*4+3]*1.05;
+      const y = hAt(x, z);
+      spawnP(x + rr(-1.5,1.5), y + rr(0,1), z + rr(-1.5,1.5),
+        rx*rr(4,10) + w.dirx*w.speed*rr(0.3,0.7), rr(5,13)*Math.min(1, w.speed/18 + 0.3), rz*rr(4,10) + w.dirz*w.speed*rr(0.3,0.7),
+        rr(1.0, 2.2), rr(0.15, 0.55), 5 + (rnd()*4|0), 0.9, 0.7, 9.8);
+    }
   }
 }
-function startSwallow(){
-  const w = worm;
-  w.state = 'swallow'; w.st = 0;
-  const tx = th ? th.x : w.hx, tz = th ? th.z : w.hz;
-  w.tx = tx; w.tz = tz; w.ty = hS(tx, tz);
-  w.sy0 = w.hy; w.sx0 = w.hx; w.sz0 = w.hz; w.geysered = false;
+function surfaceAhead(w){
+  let sum = 0, ws = 0;
+  for (const [o, wt] of [[-4, 1], [6, 1.4], [16, 1.2], [28, 0.8]]){ sum += hS(w.hx + w.dirx*o, w.hz + w.dirz*o)*wt; ws += wt; }
+  return sum/ws;
+}
+function eatThumper(x, z, msgText){
+  if (th){ th.gone = true; th = null; }
+  sfx.roar(Math.max(0.3, distVol(x, z, 500)));
+  cam.shake = Math.max(cam.shake, 1.1*clamp(1 - Math.hypot(pl.x - x, pl.z - z)/250, 0.15, 1));
+  showMsg(msgText, 3);
+}
+function frontBlocked(w){
+  // the surfaced head ploughs through: whoever stands right in front is thrown aside
+  if (pl.state === 'ride' || pl.state === 'hooking' || pl.state === 'tumble' || pl.state === 'swallowed') return;
+  const S = w.sph;
+  for (let k = 0; k < 8; k++){
+    if (!w.exp[k]) continue;
+    const d = Math.hypot(pl.x - S[k*4], pl.z - S[k*4+2]);
+    if (d < S[k*4+3]*0.9 && pl.y < S[k*4+1] + S[k*4+3]){ knockback(S[k*4] - w.dirx*3, S[k*4+2] - w.dirz*3); return; }
+  }
+}
+function startStrike(w){
+  w.st = 0; w.ate = false;
+  if (w.mode === 'h'){ w.state = 'bite'; }
+  else {
+    w.state = 'gulp';
+    w.tx = w.hx; w.tz = w.hz; w.ty = hS(w.hx, w.hz); w.gy0 = w.hy;
+    w.craterT = 0;
+  }
+}
+function swallowPlayer(cx, cz){
+  pl.state = 'swallowed'; pl.timer = 0; pl.swx = cx; pl.swz = cz;
+  pl.vx = pl.vz = pl.svx = pl.svz = pl.vy = 0;
+  hook = null;
+  cam.shake = Math.max(cam.shake, 1.6);
+  sfx.blast();
+  showMsg('Englouti…', 2.4);
 }
 function updateWorm(dt){
   const w = worm; if (!w) return;
@@ -1616,131 +1708,134 @@ function updateWorm(dt){
   const prevx = w.hx, prevz = w.hz;
   if (w.state === 'approach'){
     w.prog = clamp(w.s/w.len, 0, 1);
-    w.speed = lerp(13, 19, w.prog);
+    if (w.mode === 'h' && w.s > w.len - SURF) w.speed = lerp(w.speed, Math.min(w.vU, surfSpeed(w)), damp(3, dt));
+    else w.speed = w.vU*lerp(0.9, 1.1, w.prog);
     w.s += w.speed*dt;
-    if (w.s >= w.len - 2){ startSwallow(); }
-    else {
-      const p = pathAt(w, w.s);
-      w.hx = p[0]; w.hy = p[1]; w.hz = p[2];
-    }
-    // jets along the predicted path
-    w.jetT -= dt;
-    if (w.jetT <= 0){
-      w.jetT = lerp(2.1, 0.85, w.prog)*rr(0.8, 1.2);
-      const ahead = rr(22, 55);
-      const s = w.s + ahead;
-      if (s < w.len - 8){ const p = pathAt(w, s); spawnJet(p[0], p[2], 0.45 + 0.8*w.prog); }
-    }
-    // crest crossings: breach, mount window, knockback
-    for (const c of w.cross){
-      if (c.done) continue;
-      if (!c.armed && w.s >= c.s - 16){
-        // the player standing on this crest is safe from the blast: the back is about to break through
-        const d = Math.hypot(pl.x - c.x, pl.z - c.z);
-        const onFoot = pl.state === 'ground' || pl.state === 'plant' || (pl.state === 'air' && pl.y - hAt(pl.x, pl.z) < 1.6);
-        c.armed = true;
-        c.player = d < 9.5 && onFoot && hS(pl.x, pl.z) > c.h - 2.3;
+    if (w.s >= w.len - 1){ w.s = w.len - 1; startStrike(w); }
+    const p = pathAt(w, w.s);
+    w.hx = p[0]; w.hy = p[1]; w.hz = p[2];
+    const under = headUnder(w);
+    if (under){
+      // jets along the predicted path
+      w.jetT -= dt;
+      if (w.jetT <= 0){
+        w.jetT = lerp(0.9, 0.45, w.prog)*rr(0.8, 1.2);
+        const s = w.s + rr(15, 35);
+        const lim = w.mode === 'h' ? w.len - SURF : w.len - 8;
+        if (s < lim){ const q = pathAt(w, s); spawnJet(q[0], q[2], 0.45 + 0.8*w.prog); }
       }
-      if (w.s >= c.s - 6){
-        c.done = true;
-        spawnJet(c.x, c.z, 1.25);
-        cam.shake = Math.max(cam.shake, 0.6*distVol(c.x, c.z, 200));
-        const d = Math.hypot(pl.x - c.x, pl.z - c.z);
-        if (c.player && d < 11 && pl.state !== 'tumble' && pl.state !== 'roll'){ mw = { t: 0, dur: 1.1, c }; }
+      w.hissT -= dt;
+      if (w.hissT <= 0){
+        w.hissT = 0.04;
+        const S = w.sph;
+        for (let i = 0; i < 6; i++){
+          const k = (rnd()*rnd()*12)|0;
+          const x = S[k*4] + rr(-6,6), z = S[k*4+2] + rr(-6,6), y0 = hAt(x, z);
+          spawnP(x, y0 + 0.2, z, rr(-1.5,1.5) + w.dirx*5 + wind*2, rr(1.5,6), rr(-1.5,1.5) + w.dirz*5, rr(0.6,1.4), rr(0.3,0.8), 6 + (rnd()*4|0), 0.7, 1.2, 6);
+        }
       }
-    }
-    if (mw){
-      mw.t += dt;
-      if (mw.t > mw.dur){ const c = mw.c; mw = null; knockback(w.hx - w.dirx*4, w.hz - w.dirz*4); }
-    } else if (pl.state !== 'tumble' && pl.state !== 'ride' && pl.state !== 'mounting'){
-      const d = Math.hypot(pl.x - w.hx, pl.z - w.hz);
-      const pending = w.cross.some(c => c.player && !c.done);
-      if (d < WR + 3 && !pending) knockback(w.hx - w.dirx*6, w.hz - w.dirz*6);
-    }
-    w.mouth = lerp(w.mouth, (w.hy + WR > hAt(w.hx, w.hz) - 0.5) ? 0.35 : 0, damp(6, dt));
-    // hiss spray above the bulge
-    w.hissT -= dt;
-    if (w.hissT <= 0){
-      w.hissT = 0.04;
-      const S = w.sph;
-      for (let i = 0; i < 6; i++){
-        const k = (rnd()*rnd()*12)|0;
-        const x = S[k*4] + rr(-6,6), z = S[k*4+2] + rr(-6,6), y0 = hAt(x, z);
-        spawnP(x, y0 + 0.2, z, rr(-1.5,1.5) + w.dirx*5 + wind*2, rr(1.5,6), rr(-1.5,1.5) + w.dirz*5, rr(0.6,1.4), rr(0.3,0.8), 6 + (rnd()*4|0), 0.7, 1.2, 6);
-      }
-    }
-  } else if (w.state === 'swallow'){
-    w.st += dt;
-    const st = w.st, dx = w.dirx, dz = w.dirz;
-    if (st < 1.3){
-      const e = 1 - Math.pow(1 - st/1.3, 2.2);
-      w.hx = lerp(w.sx0, w.tx + dx*2, e); w.hz = lerp(w.sz0, w.tz + dz*2, e); w.hy = lerp(w.sy0, w.ty + 22, e);
-      w.mouth = ss(0, 0.6, st);
-    } else if (st < 2.3){
-      const e = (st - 1.3);
-      w.hx = w.tx + dx*(2 + e*6); w.hz = w.tz + dz*(2 + e*6); w.hy = w.ty + 22 + e*2.5;
-      w.mouth = lerp(1, 0.25, ss(0, 1, e));
+      w.mouth = lerp(w.mouth, 0, damp(4, dt));
     } else {
-      const k = (st - 2.3)/2.7;
-      w.hx = w.tx + dx*(8 + k*42); w.hz = w.tz + dz*(8 + k*42); w.hy = w.ty + 24.5 - Math.pow(k, 1.5)*62;
-      w.mouth = lerp(w.mouth, 0, damp(3, dt));
-      if (st > 5.0){ w.state = 'dive'; w.dt = 0; w.heading = Math.atan2(dx, dz); w.vy = -10; }
+      if (!w.surfaced){ w.surfaced = true; spawnJet(w.hx, w.hz, 1.1); sfx.roar(Math.max(0.25, distVol(w.hx, w.hz, 400))*0.7); }
+      sandWalls(w, 170*dt, 0, 5);
+      w.mouth = lerp(w.mouth, 0.12, damp(3, dt));
+      frontBlocked(w);
     }
-    if (!w.geysered && st > 0.35){
-      w.geysered = true;
-      geyser(w.tx, w.tz);
-      sfx.roar(Math.max(0.25, distVol(w.tx, w.tz, 500)));
-      const d = Math.hypot(pl.x - w.tx, pl.z - w.tz);
-      cam.shake = Math.max(cam.shake, 1.4*clamp(1 - d/250, 0.15, 1));
-      if (th){ th.gone = true; th = null; }
-      if (d < 14 && pl.state !== 'ride') knockback(w.tx, w.tz);
-      showMsg('Le marteleur a été englouti.', 3);
+  } else if (w.state === 'bite'){
+    // horizontal arrival: the head ploughs on slowly and swallows the thumper
+    w.st += dt;
+    const st = w.st;
+    w.speed = lerp(w.speed, 4.5, damp(2, dt));
+    w.hx += w.dirx*w.speed*dt; w.hz += w.dirz*w.speed*dt;
+    const yt = surfaceAhead(w) - WR*0.05 + 1.4*ss(0, 0.5, st)*(1 - ss(1.4, 2.0, st));
+    w.hy = lerp(w.hy, yt, damp(4, dt));
+    w.mouth = ss(0, 0.5, st)*(1 - ss(1.3, 2.0, st));
+    if (!w.ate && st > 0.5){
+      w.ate = true;
+      const fx = w.hx + w.dirx*WR, fz = w.hz + w.dirz*WR, fy = hAt(fx, fz);
+      for (let i = 0; i < 260; i++){
+        const a = rnd()*6.283;
+        spawnP(fx + Math.cos(a)*rr(0,4), fy + rr(0,4), fz + Math.sin(a)*rr(0,4), -w.dirx*rr(2,7) + Math.cos(a)*rr(0,3), rr(1,9), -w.dirz*rr(2,7) + Math.sin(a)*rr(0,3), rr(0.6,1.6), rr(0.15,0.5), 5 + (rnd()*5|0), 0.9, 1, 9);
+      }
+      eatThumper(fx, fz, 'Le ver a avalé le marteleur.');
     }
+    sandWalls(w, 120*dt, 0, 5);
+    frontBlocked(w);
+    if (st > 2.3){ w.state = 'dive'; w.dt = 0; w.vy = -0.5; w.heading = Math.atan2(w.dirx, w.dirz); }
+  } else if (w.state === 'gulp'){
+    // vertical strike: only the open mouth comes up, in a funnel of sliding sand
+    w.st += dt;
+    const st = w.st, yTop = w.ty - WR*0.84;
+    w.hx = w.tx; w.hz = w.tz;
+    // rise (0.9 s), hold still with the mouth open (2.5 s), then sink back down the same hole
+    const T1 = 0.9, T2 = T1 + 2.5, T3 = T2 + 1.4;
+    if (st < T1){ const e = st/T1; w.hy = lerp(w.gy0, yTop, 1 - Math.pow(1 - e, 3)); w.mouth = 0.33*ss(0.35, 0.85, st); }
+    else if (st < T2){ w.hy = yTop; w.mouth = 0.33; }
+    else if (st < T3){
+      const k = (st - T2)/(T3 - T2);
+      w.mouth = 0.33*(1 - ss(0, 0.35, k));
+      w.hy = lerp(yTop, w.gy0, k*k*(3 - 2*k));
+      // sand collapses into the closing hole
+      for (let i = 0; i < 200*dt; i++){
+        const a = rnd()*6.283, r = rr(2, 9), x = w.tx + Math.cos(a)*r, z = w.tz + Math.sin(a)*r, sp = rr(2, 5);
+        spawnP(x, hAt(x, z) + 0.1, z, -Math.cos(a)*sp, rr(0, 1.5), -Math.sin(a)*sp, r/sp*0.8, rr(0.12, 0.35), 5 + (rnd()*5|0), 0.85, 0.3, 3);
+      }
+    }
+    else { worm = null; hookTarget = -1; return; }
+    w.retract = st >= T2;
+    if (st > 0.35 && st < 0.4 + dt) spawnJet(w.tx, w.tz, 0.9);
+    // crater
+    if (st > 0.3 && st < T2 + 0.6){
+      w.craterT -= dt;
+      if (w.craterT <= 0){ w.craterT = 0.1; stampCrater(w.tx, w.tz, 16, 3.0*ss(0.3, 1.6, st)); }
+      const rate = (st < T2 ? 240 : 80)*dt;
+      for (let i = 0; i < rate; i++){
+        const a = rnd()*6.283, r = rr(5.5, 17);
+        const x = w.tx + Math.cos(a)*r, z = w.tz + Math.sin(a)*r, sp = rr(3, 7);
+        spawnP(x, hAt(x, z) + 0.1, z, -Math.cos(a)*sp, rr(-0.5, 1.2), -Math.sin(a)*sp, (r - 4)/sp, rr(0.1, 0.35), 5 + (rnd()*5|0), 0.85, 0.2, 1.5);
+      }
+    }
+    if (!w.ate && st > 0.75){ w.ate = true; eatThumper(w.tx, w.tz, 'Le ver a englouti le marteleur.'); }
+    if (pl.state !== 'ride' && pl.state !== 'swallowed' && pl.state !== 'hooking'){
+      const dx = w.tx - pl.x, dz = w.tz - pl.z, d = Math.hypot(dx, dz);
+      if (st > 0.45 && st < T2 && d < 9 && pl.knockCd <= 0 && pl.y < hAt(pl.x, pl.z) + 2.5) swallowPlayer(w.tx, w.tz);
+      else if (st > 0.3 && st < T2 && d < 19 && d > 0.1 && pl.state === 'ground'){ pl.svx += dx/d*5.5*dt; pl.svz += dz/d*5.5*dt; }
+    }
+    const d = Math.hypot(pl.x - w.tx, pl.z - w.tz);
+    if (st < T1 + 0.3) cam.shake = Math.max(cam.shake, 0.5*clamp(1 - d/200, 0, 1));
   } else if (w.state === 'ride'){
     let steer = 0;
     if (state === 'play') steer = (keys.l ? 1 : 0) - (keys.r ? 1 : 0) - touch.kx;
     steer = clamp(steer, -1, 1);
+    if (pl.state !== 'ride') steer = 0;
     w.turn += (steer*0.42 - w.turn)*damp(1.6, dt);
     w.heading += w.turn*dt;
     const thr = (keys.f ? 1 : 0) - (keys.b ? 1 : 0) - touch.ky;
-    w.speed = lerp(w.speed, 21 + clamp(thr, -1, 1)*4, damp(1.2, dt));
+    w.speed = lerp(w.speed, 21 + clamp(thr, -1, 1)*4, damp(pl.state === 'ride' ? 1.2 : 0.4, dt));
     w.dirx = Math.sin(w.heading); w.dirz = Math.cos(w.heading);
     w.hx += w.dirx*w.speed*dt; w.hz += w.dirz*w.speed*dt;
-    let sum = 0, wsum = 0;
-    for (const [o, wt] of [[-4, 1], [6, 1.4], [16, 1.2], [28, 0.8]]){ sum += hS(w.hx + w.dirx*o, w.hz + w.dirz*o)*wt; wsum += wt; }
-    const yt = sum/wsum - WR*0.52;
+    w.rideT = (w.rideT || 0) + dt;
+    const yt = surfaceAhead(w) - WR*lerp(0.05, 0.52, ss(0, 3, w.rideT));
     w.vy += ((yt - w.hy)*3.2 - w.vy*2.4)*dt;
     w.hy += w.vy*dt;
     w.mouth = lerp(w.mouth, 0, damp(3, dt));
-    // walls of sand on both sides
-    const S = w.sph;
-    const rate = 420*dt;
-    for (let side = -1; side <= 1; side += 2){
-      const rx = -w.dirz*side, rz = w.dirx*side;
-      for (let i = 0; i < rate; i++){
-        const k = 1 + (rnd()*4|0);
-        const x = S[k*4] + rx*S[k*4+3]*1.05, z = S[k*4+2] + rz*S[k*4+3]*1.05;
-        const y = hAt(x, z);
-        spawnP(x + rr(-1.5,1.5), y + rr(0,1), z + rr(-1.5,1.5),
-          rx*rr(4,10) + w.dirx*w.speed*rr(0.3,0.7), rr(6,14), rz*rr(4,10) + w.dirz*w.speed*rr(0.3,0.7),
-          rr(1.0, 2.2), rr(0.15, 0.55), 5 + (rnd()*4|0), 0.9, 0.7, 9.8);
-      }
-    }
+    sandWalls(w, 420*dt, 1, 4);
   } else if (w.state === 'dive'){
     w.dt += dt;
     w.dirx = Math.sin(w.heading); w.dirz = Math.cos(w.heading);
-    w.speed = lerp(w.speed, 17, damp(1, dt));
+    w.speed = lerp(w.speed, 15, damp(0.8, dt));
     w.hx += w.dirx*w.speed*dt; w.hz += w.dirz*w.speed*dt;
-    w.vy = lerp(w.vy, -7, damp(0.8, dt));
+    w.vy = lerp(w.vy, -6, damp(0.6, dt));
     w.hy += w.vy*dt;
     w.mouth = lerp(w.mouth, 0, damp(3, dt));
-    if (w.dt > 4 && ((frameNo % 20) === 0 || w.dt > 16)){
+    if (w.rN) sandWalls(w, 140*dt, 0, 8);
+    if (w.dt > 4 && ((frameNo % 20) === 0 || w.dt > 18)){
       let any = false; const S = w.sph;
       for (let j = 0; j < WN; j++) if (S[j*4+1] + S[j*4+3] > hS(S[j*4], S[j*4+2]) - 2){ any = true; break; }
-      if (!any || w.dt > 16){ worm = null; mw = null; return; }
+      if (!any || w.dt > 18){ worm = null; hookTarget = -1; return; }
     }
   }
-  if (w.state !== 'ride'){
+  if (w.state !== 'ride' && w.state !== 'gulp'){
     const ddx = w.hx - prevx, ddz = w.hz - prevz, l = Math.hypot(ddx, ddz);
     if (l > 1e-4){ w.dirx = ddx/l; w.dirz = ddz/l; }
   }
@@ -1748,109 +1843,261 @@ function updateWorm(dt){
   wormSpheres();
   stampFurrow(w);
 }
+
+// ---------- hooks ----------
+let hook = null, hookTarget = -1;
+function canHook(){ return pl.state === 'ground' || pl.state === 'air' || pl.state === 'plant' || pl.state === 'roll'; }
+function findHookTarget(){
+  hookTarget = -1;
+  const w = worm;
+  if (!w || !w.rN || w.state === 'gulp' || w.state === 'ride' || !canHook()) return;
+  const S = w.sph;
+  let bd = 9;
+  for (let k = 0; k < WN - 4; k++){
+    if (!w.exp[k]) continue;
+    const r = S[k*4+3], top = S[k*4+1] + r;
+    if (top < hS(S[k*4], S[k*4+2]) + 1.2) continue;      // too little of it out of the sand
+    const d = Math.hypot(pl.x - S[k*4], pl.z - S[k*4+2]) - r;
+    if (d < bd && pl.y < top + 5){ bd = d; hookTarget = k; }
+  }
+}
+const G_HOOK = 14;
+function throwHooks(){
+  const w = worm, S = w.sph, k = hookTarget;
+  let dx = pl.x - S[k*4], dz = pl.z - S[k*4+2]; const l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;
+  const r = S[k*4+3];
+  const ox = dx*r*0.78, oy = r*0.6, oz = dz*r*0.78;
+  // ballistic throw aimed where the attach point will be when the hooks land
+  const T = 0.5;
+  const rx = -Math.cos(Math.atan2(-dx, -dz)), rz = Math.sin(Math.atan2(-dx, -dz));
+  const hooks = [-1, 1].map(s => {
+    const hx = pl.x + rx*s*0.22, hy = pl.y + 1.45, hz = pl.z + rz*s*0.22;
+    const tx = S[k*4] + ox + rx*s*0.7 + w.dirx*w.speed*T, ty = S[k*4+1] + oy, tz = S[k*4+2] + oz + rz*s*0.7 + w.dirz*w.speed*T;
+    return { s, x: hx, y: hy, z: hz, vx: (tx - hx)/T, vy: (ty - hy)/T + 0.5*G_HOOK*T, vz: (tz - hz)/T, stuck: false };
+  });
+  hook = { k, ox, oy, oz, t: 0, phase: 'fly', T, hooks, rel0: null, yaw0: 0 };
+  pl.state = 'hooking'; pl.timer = 0; pl.vx = pl.vz = pl.svx = pl.svz = 0;
+  pl.yaw = Math.atan2(-dx, -dz);
+  hookTarget = -1;
+  noiseHit({ f0: 900, f1: 2600, q: 1.2, vol: 0.2, dur: 0.4, att: 0.05 });
+}
+function hookPoint(s){
+  const S = worm.sph, k = hook.k;
+  const rx = -Math.cos(pl.yaw), rz = Math.sin(pl.yaw);
+  return [S[k*4] + hook.ox + rx*s*0.7, S[k*4+1] + hook.oy, S[k*4+2] + hook.oz + rz*s*0.7];
+}
+// ropes are drawn fresh every frame (not as particles) so they never smear or flicker
+const ephem = [];
+function drawRope(ax, ay, az, bx, by, bz, sag){
+  const d = Math.hypot(bx - ax, by - ay, bz - az);
+  const n = clamp(Math.floor(d*11), 4, 220);
+  for (let i = 0; i <= n; i++){
+    const t = i/n;
+    ephem.push(lerp(ax, bx, t), lerp(ay, by, t) - 4*t*(1 - t)*sag, lerp(az, bz, t), 0.03, 13, 1);
+  }
+}
+function beginRide(){
+  const w = worm;
+  w.state = 'ride';
+  w.heading = Math.atan2(w.dirx, w.dirz);
+  w.turn = 0; w.vy = 0; w.speed = Math.max(w.speed, 9); w.rideT = 0;
+  if (th) th.active = false;
+}
+function updateHook(dt){
+  if (!worm){ hook = null; pl.state = 'air'; pl.vy = 0; return; }
+  hook.t += dt;
+  const S = worm.sph, k = hook.k;
+  const rx = -Math.cos(pl.yaw), rz = Math.sin(pl.yaw);
+  if (hook.phase === 'fly'){
+    pl.arms = lerp(pl.arms, 1, damp(14, dt)); pl.crouch = lerp(pl.crouch, 0.25, damp(8, dt));
+    let all = true;
+    for (const h of hook.hooks){
+      if (!h.stuck){
+        h.vy -= G_HOOK*dt; h.x += h.vx*dt; h.y += h.vy*dt; h.z += h.vz*dt;
+        const A = hookPoint(h.s);
+        if (hook.t >= hook.T || Math.hypot(h.x - A[0], h.y - A[1], h.z - A[2]) < 0.6) h.stuck = true;
+        else all = false;
+      }
+      const p = h.stuck ? hookPoint(h.s) : [h.x, h.y, h.z];
+      const hx = pl.x + rx*h.s*0.22, hy = pl.y + 1.45, hz = pl.z + rz*h.s*0.22;
+      // slack rope while flying, sagging less as it pays out
+      drawRope(hx, hy, hz, p[0], p[1], p[2], h.stuck ? 0.15 : 0.6*(1 - hook.t/hook.T) + 0.2);
+      ephem.push(p[0], p[1], p[2], 0.28, 12, 1);
+    }
+    if (all){
+      hook.phase = 'pull'; hook.t = 0;
+      hook.rel0 = [pl.x - S[k*4], pl.y - S[k*4+1], pl.z - S[k*4+2]];
+      hook.c0 = [S[k*4], S[k*4+1], S[k*4+2]];
+      hook.yaw0 = pl.yaw;
+      noiseHit({ type: 'highpass', f0: 2500, vol: 0.35, dur: 0.18 });
+      oscHit({ wave: 'square', f0: 1400, f1: 900, vol: 0.06, dur: 0.15, lp: 3000 });
+      const A = hookPoint(0);
+      for (let i = 0; i < 26; i++) spawnP(A[0], A[1], A[2], rr(-4,4), rr(0,5), rr(-4,4), rr(0.2,0.5), 0.06, 10 + (rnd()*3|0), 1, 2, 9);
+      slowmo = 0.55; cam.shake = Math.max(cam.shake, 0.8); cam.swing = 1;
+      sfx.whoosh(); sfx.roar(0.5);
+      beginRide();
+    }
+    return;
+  }
+  // pulled in by the ropes, then over the top: everything in the worm's own frame,
+  // so the rider keeps the worm's speed and never lags or snaps
+  const D = 1.6;
+  const e = Math.min(1, hook.t/D);
+  const C = [S[k*4], S[k*4+1], S[k*4+2]];
+  const B = wormBack();
+  const relB = [B[0] - C[0], B[1] - C[1], B[2] - C[2]];
+  const relA = [hook.ox, hook.oy - 1.0, hook.oz];          // against the flank, below the hooks
+  const r0 = hook.rel0;
+  // one continuous cubic path in the worm's frame: pulled against the flank under the
+  // hooks, then up and over onto the back. Smooth start and soft landing.
+  const P1 = [relA[0], relA[1] - 0.5, relA[2]];
+  const P2 = [relA[0]*0.35, Math.max(relA[1], relB[1]) + 1.4, relA[2]*0.35];
+  const q = e*e*(3 - 2*e), u1 = 1 - q;
+  const c0 = u1*u1*u1, c1 = 3*u1*u1*q, c2 = 3*u1*q*q, c3 = q*q*q;
+  const rel = [0, 1, 2].map(i => c0*r0[i] + c1*P1[i] + c2*P2[i] + c3*relB[i]);
+  const sw = Math.sin(2*Math.PI*e)*Math.sin(Math.PI*e)*0.25;   // slight pendulum on the ropes
+  rel[0] += rx*sw; rel[2] += rz*sw;
+  // the ropes take up the slack: the rider is eased into the worm's motion instead of yanked
+  const g = ss(0, 0.5, hook.t);
+  pl.x = C[0] + rel[0] - (C[0] - hook.c0[0])*(1 - g);
+  pl.y = C[1] + rel[1] - (C[1] - hook.c0[1])*(1 - g);
+  pl.z = C[2] + rel[2] - (C[2] - hook.c0[2])*(1 - g);
+  pl.vx = worm.dirx*worm.speed*g; pl.vz = worm.dirz*worm.speed*g;
+  pl.yaw = hook.yaw0 + angWrap(worm.heading - hook.yaw0)*ss(0.5, 1, e);
+  pl.arms = lerp(1, 0.15, ss(0.55, 1, e));
+  pl.crouch = lerp(0.35, 0.45, ss(0.3, 1, e)) + 0.2*Math.sin(Math.PI*ss(0.45, 0.95, e));
+  pl.lean = 0.5;
+  if (e < 0.8){
+    const ropeK = 1 - ss(0.6, 0.8, e);
+    for (const s of [-1, 1]){
+      const A = hookPoint(s);
+      if (ropeK > 0.05) drawRope(pl.x + rx*s*0.22, pl.y + 1.45, pl.z + rz*s*0.22, A[0], A[1], A[2], 0.05);
+      ephem.push(A[0], A[1], A[2], 0.28, 12, 1);
+    }
+  }
+  if (e < 0.6 && rnd() < 0.5) kick(2, 0.6);
+  if (e >= 1){ pl.state = 'ride'; hook = null; showMsg('Vous chevauchez le géant.', 2.5); }
+}
+
+// ---------- sand deformation ----------
+function stampCrater(x, z, R, depth){
+  const i0 = Math.floor((x - R)/DC), i1 = Math.floor((x + R)/DC), j0 = Math.floor((z - R)/DC), j1 = Math.floor((z + R)/DC);
+  for (let j = j0; j <= j1; j++){
+    const jj = j & 511;
+    for (let i = i0; i <= i1; i++){
+      const d = Math.hypot((i + 0.5)*DC - x, (j + 0.5)*DC - z)/R;
+      if (d >= 1) continue;
+      const idx = jj*512 + (i & 511);
+      const v = -depth*(1 - d*d);
+      if (v < furrow[idx]) furrow[idx] = v;
+      mark[idx] = Math.max(mark[idx], 1 - d);
+    }
+    markRow(jj);
+  }
+  uploadRect(i0, j0, i1 - i0 + 1, j1 - j0 + 1);
+}
+function markRow(j){ if (!rowAny[j]){ rowAny[j] = 1; rowLast[j] = time; } }
 function stampFurrow(w){
   const S = w.sph;
+  let r0 = null;
+  const under = w.state === 'approach' && headUnder(w);
   for (let k = 0; k < 10; k++){
     const x = S[k*4], y = S[k*4+1], z = S[k*4+2], r = S[k*4+3];
     const D = hS(x, z) - (y + r);
-    const appr = w.state === 'approach';
-    if (D > (appr ? 7 : 3)) continue;
-    const str = appr ? clamp(1 - D/7, 0, 1) : clamp(1 - D/3, 0, 1);
-    const depth = appr ? 0.9*clamp(1 - D/3.5, 0, 1) : 1.4*str;
+    if (D > (under ? 7 : 3)) continue;
+    const str = under ? clamp(1 - D/7, 0, 1) : clamp(1 - D/3, 0, 1);
+    const depth = under ? 0.9*clamp(1 - D/3.5, 0, 1) : 1.4*str;
     const R = r*1.25;
     const i0 = Math.floor((x - R)/DC), i1 = Math.floor((x + R)/DC), j0 = Math.floor((z - R)/DC), j1 = Math.floor((z + R)/DC);
-    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++){
-      const cx = (i + 0.5)*DC, cz = (j + 0.5)*DC;
-      const f = bump(Math.hypot(cx - x, cz - z)/R);
-      if (f <= 0) continue;
-      const idx = (j & 511)*512 + (i & 511);
-      const v = -depth*f;
-      if (v < furrow[idx]) furrow[idx] = v;
-      if (str*f > mark[idx]) mark[idx] = Math.min(1, str*f);
-      furrowAny = true;
+    for (let j = j0; j <= j1; j++){
+      const jj = j & 511;
+      for (let i = i0; i <= i1; i++){
+        const f = bump(Math.hypot((i + 0.5)*DC - x, (j + 0.5)*DC - z)/R);
+        if (f <= 0) continue;
+        const idx = jj*512 + (i & 511);
+        const v = -depth*f;
+        if (v < furrow[idx]) furrow[idx] = v;
+        if (str*f > mark[idx]) mark[idx] = Math.min(1, str*f);
+      }
+      markRow(jj);
     }
-    if (!w.fr) w.fr = [i0, j0, i1, j1];
-    else { w.fr[0] = Math.min(w.fr[0], i0); w.fr[1] = Math.min(w.fr[1], j0); w.fr[2] = Math.max(w.fr[2], i1); w.fr[3] = Math.max(w.fr[3], j1); }
+    if (!r0) r0 = [i0, j0, i1, j1];
+    else { r0[0] = Math.min(r0[0], i0); r0[1] = Math.min(r0[1], j0); r0[2] = Math.max(r0[2], i1); r0[3] = Math.max(r0[3], j1); }
   }
+  if (r0 && r0[2] - r0[0] < 200 && r0[3] - r0[1] < 200) uploadRect(r0[0], r0[1], r0[2] - r0[0] + 1, r0[3] - r0[1] + 1);
 }
+// The moving bulge lives in a small worm-centred texture rebuilt every frame (cheap).
 function computeBulge(){
-  const old = bulgeRects; bulgeRects = [];
-  for (const r of old){
-    for (let j = r[1]; j <= r[3]; j++) for (let i = r[0]; i <= r[2]; i++) bulge[(j & 511)*512 + (i & 511)] = 0;
-  }
   const w = worm;
+  if (!w){ if (blOn){ blOn = false; bulgeL.fill(0); } return; }
+  bulgeL.fill(0); blStamp++;
+  blOx = Math.floor((w.cx - BL*DC/2)/DC)*DC; blOz = Math.floor((w.cz - BL*DC/2)/DC)*DC;
+  const S = w.sph;
   const src = [];
-  const trem = [];
-  if (w){
-    const S = w.sph;
-    let x0 = 1e9, x1 = -1e9, z0 = 1e9, z1 = -1e9;
-    for (let k = 0; k < WN; k++){
-      const x = S[k*4], y = S[k*4+1], z = S[k*4+2], r = S[k*4+3];
-      if (hS(x, z) - (y + r) > 10) continue;
-      src.push([x, y, z, r]);
-      const R = r*2.3;
-      x0 = Math.min(x0, x - R); x1 = Math.max(x1, x + R); z0 = Math.min(z0, z - R); z1 = Math.max(z1, z + R);
-    }
-    if (w.state === 'approach' || w.state === 'ride'){
-      const r = S[3], x = S[0] + w.dirx*r*0.9, z = S[2] + w.dirz*r*0.9;
-      src.push([x, S[1] + (w.state === 'ride' ? -3 : 0), z, r*0.8, 1]);
-    }
-    if (src.length) bulgeRects.push([Math.floor(x0/DC), Math.floor(z0/DC), Math.floor(x1/DC), Math.floor(z1/DC)]);
-    if (w.state === 'approach'){
-      for (const c of w.cross){
-        const ds = c.s - w.s;
-        if (ds > 0 && ds < 95){
-          trem.push([c.x, c.z, 0.3*(1 - ds/95)]);
-          bulgeRects.push([Math.floor((c.x - 14)/DC), Math.floor((c.z - 14)/DC), Math.floor((c.x + 14)/DC), Math.floor((c.z + 14)/DC)]);
-        }
-      }
-    }
-    if (bulgeRects.length && bulgeRects[0][2] - bulgeRects[0][0] > 200){ bulgeRects[0][2] = bulgeRects[0][0] + 200; }
-    if (bulgeRects.length && bulgeRects[0][3] - bulgeRects[0][1] > 200){ bulgeRects[0][3] = bulgeRects[0][1] + 200; }
+  for (let k = 0; k < WN; k++){
+    const x = S[k*4], y = S[k*4+1], z = S[k*4+2], r = S[k*4+3];
+    if (hS(x, z) - (y + r) > 10) continue;
+    src.push([x, y, z, r, 0]);
   }
-  for (const r of bulgeRects){
-    for (let j = r[1]; j <= r[3]; j++) for (let i = r[0]; i <= r[2]; i++){
-      const idx = (j & 511)*512 + (i & 511);
-      const cx = (i + 0.5)*DC, cz = (j + 0.5)*DC;
-      let v = 0;
-      if (src.length){
-        const hs = hS(cx, cz) + furrow[idx];
-        for (let k = 0; k < src.length; k++){
-          const s = src[k];
-          const dx = cx - s[0], dz = cz - s[2]; const d2 = dx*dx + dz*dz; const reach = s[3]*2.3;
-          if (d2 > reach*reach) continue;
-          const d = Math.sqrt(d2);
-          const D = hs - (s[1] + s[3]);
-          let b;
-          if (s[4]) b = 1.3*bump(d/(s[3]*1.6))*clamp(1 - D/6, 0, 1);
-          else if (D > 0) b = 3.0*Math.exp(-D/4.0)*bump(d/(s[3]*2.1));
-          else b = (1.4 + Math.min(2.2, -D*0.3))*bump(Math.abs(d - s[3]*0.95)/(s[3]*0.85));
-          if (b > v) v = b;
-        }
-      }
-      for (const t of trem){
-        const d = Math.hypot(cx - t[0], cz - t[1]);
-        if (d < 14) v += t[2]*Math.sin(time*38 + cx*1.3 + cz*0.7)*bump(d/14);
-      }
-      bulge[idx] = v;
+  if ((w.state === 'approach' || w.state === 'ride' || w.state === 'bite') && src.length){
+    const r = S[3];
+    src.push([S[0] + w.dirx*r*0.9, S[1] + (w.state === 'approach' && headUnder(w) ? 0 : -3), S[2] + w.dirz*r*0.9, r*0.8, 1]);
+  }
+  for (const s of src){
+    const reach = s[3]*(s[4] ? 1.6 : 2.3);
+    const i0 = Math.max(1, Math.floor((s[0] - reach - blOx)/DC)), i1 = Math.min(BL - 2, Math.floor((s[0] + reach - blOx)/DC));
+    const j0 = Math.max(1, Math.floor((s[2] - reach - blOz)/DC)), j1 = Math.min(BL - 2, Math.floor((s[2] + reach - blOz)/DC));
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++){
+      const cx = blOx + (i + 0.5)*DC, cz = blOz + (j + 0.5)*DC;
+      const dx = cx - s[0], dz = cz - s[2], d2 = dx*dx + dz*dz;
+      if (d2 > reach*reach) continue;
+      const idx = j*BL + i;
+      if (blMark[idx] !== blStamp){ blMark[idx] = blStamp; blHs[idx] = hS(cx, cz) + hFur(cx, cz); }
+      const d = Math.sqrt(d2), D = blHs[idx] - (s[1] + s[3]);
+      let b;
+      if (s[4]) b = 1.3*bump(d/(s[3]*1.6))*clamp(1 - D/6, 0, 1);
+      else if (D > 0) b = 3.0*Math.exp(-D/4.0)*bump(d/(s[3]*2.1));
+      else b = (1.4 + Math.min(2.2, -D*0.3))*bump(Math.abs(d - s[3]*0.95)/(s[3]*0.85));
+      if (b > bulgeL[idx]) bulgeL[idx] = b;
     }
   }
-  for (const r of old) uploadRect(r[0], r[1], r[2] - r[0] + 1, r[3] - r[1] + 1);
-  for (const r of bulgeRects) uploadRect(r[0], r[1], r[2] - r[0] + 1, r[3] - r[1] + 1);
-  if (w && w.fr){ uploadRect(w.fr[0], w.fr[1], w.fr[2] - w.fr[0] + 1, w.fr[3] - w.fr[1] + 1); w.fr = null; }
+  if (w.state === 'approach' && headUnder(w)){
+    for (const c of w.cross){
+      const ds = c.s - w.s;
+      if (ds <= 0 || ds >= 95) continue;
+      const amp = 0.3*(1 - ds/95);
+      const i0 = Math.max(1, Math.floor((c.x - 14 - blOx)/DC)), i1 = Math.min(BL - 2, Math.floor((c.x + 14 - blOx)/DC));
+      const j0 = Math.max(1, Math.floor((c.z - 14 - blOz)/DC)), j1 = Math.min(BL - 2, Math.floor((c.z + 14 - blOz)/DC));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++){
+        const cx = blOx + (i + 0.5)*DC, cz = blOz + (j + 0.5)*DC, d = Math.hypot(cx - c.x, cz - c.z);
+        if (d < 14) bulgeL[j*BL + i] += amp*Math.sin(time*38 + cx*1.3 + cz*0.7)*bump(d/14);
+      }
+    }
+  }
+  blOn = true;
+  gl.bindTexture(gl.TEXTURE_2D, texB);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, BL, BL, gl.RED, gl.FLOAT, bulgeL);
 }
-function decayFurrow(dt){
-  decayT += dt;
-  if (decayT < 0.5 || !furrowAny) return;
-  const f = Math.exp(-decayT/55), fm = Math.exp(-decayT/45);
-  decayT = 0;
-  let any = false;
-  for (let i = 0; i < furrow.length; i++){
-    if (furrow[i] !== 0){ furrow[i] *= f; if (furrow[i] > -0.01) furrow[i] = 0; else any = true; }
-    if (mark[i] !== 0){ mark[i] *= fm; if (mark[i] < 0.01) mark[i] = 0; else any = true; }
+// Old furrows fade a few rows at a time, so there is never a big upload.
+function decayFurrow(){
+  let processed = 0, scanned = 0;
+  while (processed < 16 && scanned < DN){
+    const j = decayRow; decayRow = (decayRow + 1) & 511; scanned++;
+    if (!rowAny[j]) continue;
+    const el = time - rowLast[j];
+    if (el < 0.6) continue;
+    rowLast[j] = time;
+    const f = Math.exp(-el/55), fm = Math.exp(-el/45);
+    let any = false;
+    for (let i = j*DN, e = i + DN; i < e; i++){
+      if (furrow[i] !== 0){ furrow[i] *= f; if (furrow[i] > -0.01) furrow[i] = 0; else any = true; }
+      if (mark[i] !== 0){ mark[i] *= fm; if (mark[i] < 0.01) mark[i] = 0; else any = true; }
+    }
+    rowAny[j] = any ? 1 : 0;
+    uploadRect(0, j, DN, 1);
+    processed++;
   }
-  furrowAny = any;
-  uploadAllDisp();
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1926,7 +2173,9 @@ function rebase(){
   if (Math.abs(pl.z) > T*0.75) sz = Math.round(pl.z/T)*T;
   if (!sx && !sz) return;
   pl.x -= sx; pl.z -= sz;
-  if (pl.mountFrom){ pl.mountFrom[0] -= sx; pl.mountFrom[2] -= sz; }
+  if (pl.swx !== undefined){ pl.swx -= sx; pl.swz -= sz; }
+  if (hook){ hook.sx -= sx; hook.sz -= sz; }
+  blOx -= sx; blOz -= sz;
   cam.x -= sx; cam.z -= sz; cam.lx -= sx; cam.lz -= sz; cam.sx -= sx; cam.sz -= sz;
   if (th){ th.x -= sx; th.z -= sz; }
   if (worm){
@@ -1935,16 +2184,12 @@ function rebase(){
     for (const p of w.trail){ p.x -= sx; p.z -= sz; }
     if (w.PX){ for (let i = 0; i < w.PX.length; i++){ w.PX[i] -= sx; w.PZ[i] -= sz; } }
     if (w.cross) for (const c of w.cross){ c.x -= sx; c.z -= sz; }
-    if (w.tx !== undefined){ w.tx -= sx; w.tz -= sz; w.sx0 -= sx; w.sz0 -= sz; }
-    w.fr = null;
+    if (w.tx !== undefined){ w.tx -= sx; w.tz -= sz; }
     wormSpheres();
   }
   for (let i = 0; i < P.n; i++){ P.x[i] -= sx; P.z[i] -= sz; }
   for (let i = 0; i < 48; i++){ fp[i*4] -= sx; fp[i*4+1] -= sz; }
   for (const e of emitters){ e.x -= sx; e.z -= sz; }
-  const ci = sx/DC, cj = sz/DC;
-  for (const r of bulgeRects){ r[0] -= ci; r[2] -= ci; r[1] -= cj; r[3] -= cj; }
-  if (mw && mw.c){ /* crossing already shifted */ }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1961,7 +2206,7 @@ function camClear(tx, ty, tz, cx, cy, cz){
   return need;
 }
 function updateCamera(dt, rdt){
-  const riding = pl.state === 'ride' || pl.state === 'mounting';
+  const riding = pl.state === 'ride' || (pl.state === 'hooking' && hook && hook.phase === 'climb');
   // auto-align behind the motion when the mouse is idle
   if (state === 'play' && rtime - cam.lastMouse > 1.6){
     let ty = null, rate = 0;
@@ -2039,12 +2284,13 @@ function update(rdt){
   time += dt;
   wind = 0.75 + 0.25*Math.sin(time*0.13 + windSeed) + 0.15*Math.sin(time*0.47 + windSeed*2);
   if (state === 'loading') return;
+  ephem.length = 0;
   updateThumper(dt);
   updateWorm(dt);
-  if (mw && !worm) mw = null;
   computeBulge();
+  findHookTarget();
   updatePlayer(dt);
-  decayFurrow(dt);
+  decayFurrow();
   updateEmitters(dt);
   updateParticles(dt);
   rebase();
@@ -2086,8 +2332,10 @@ function render(){
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texH); gl.uniform1i(u.uH, 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texN); gl.uniform1i(u.uN, 1);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texD); gl.uniform1i(u.uD, 2);
-  if (worm){
-    gl.uniform4fv(u.uW, worm.sph); gl.uniform1i(u.uWN, WN);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texB); gl.uniform1i(u.uB, 5);
+  gl.uniform3f(u.uBO, blOx, blOz, blOn ? 1 : 0);
+  if (worm && worm.rN > 0){
+    gl.uniform4fv(u.uW, worm.rsph); gl.uniform1i(u.uWN, WN);
     gl.uniform4f(u.uWB, worm.bx, worm.by, worm.bz, worm.br); gl.uniform1f(u.uMouth, worm.mouth);
   } else { gl.uniform4fv(u.uW, emptyW); gl.uniform1i(u.uWN, 0); gl.uniform4f(u.uWB, 0, -1e4, 0, 1); gl.uniform1f(u.uMouth, 0); }
   // player
@@ -2097,7 +2345,7 @@ function render(){
   const lwx = wx*cy - wz*sy, lwz = wx*sy + wz*cy;
   const wl = Math.hypot(lwx, lwz), wcap = pl.state === 'ride' ? 0.75 : 0.5;
   const ws = wl > wcap ? wcap/wl : 1;
-  uPl.set([pl.x, pl.y, pl.z, pl.yaw, pl.phase, pl.stride, pl.lean, pl.crouch, lwx*ws, lwz*ws, pl.flap*(pl.state === 'ride' ? 1.6 : 1), pl.roll, pl.arms, pl.plant, pl.drag, 1]);
+  uPl.set([pl.x, pl.y, pl.z, pl.yaw, pl.phase, pl.stride, pl.lean, pl.crouch, lwx*ws, lwz*ws, pl.flap*(pl.state === 'ride' ? 1.6 : 1), pl.roll, pl.arms, pl.plant, pl.drag, pl.state === 'swallowed' ? 0 : 1]);
   gl.uniform4fv(u.uPl, uPl);
   if (th){
     uTh.set([th.x, th.y, th.z, (1 - ss(0, 1, th.drive))*1.2 + (th.gone ? 99 : 0), th.lift, th.light, 1, 0]);
@@ -2107,13 +2355,15 @@ function render(){
   gl.bindVertexArray(vaoEmpty);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   // particles
-  if (P.n > 0){
+  const nE = ephem.length/6;
+  if (P.n + nE > 0){
     let o = 0;
     for (let i = 0; i < P.n; i++){
       const lf = P.life[i]/P.max[i];
       pBuf[o++] = P.x[i]; pBuf[o++] = P.y[i]; pBuf[o++] = P.z[i]; pBuf[o++] = P.size[i];
       pBuf[o++] = P.col[i]; pBuf[o++] = P.a[i]*Math.min(1, lf*2.5)*Math.min(1, (1 - lf)*12 + 0.3);
     }
+    for (let i = 0; i < ephem.length && o < pBuf.length; i++) pBuf[o++] = ephem[i];
     gl.bindBuffer(gl.ARRAY_BUFFER, pVBO);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, pBuf, 0, o);
     gl.depthFunc(gl.LESS); gl.depthMask(false);
@@ -2126,7 +2376,7 @@ function render(){
     gl.uniform1f(pu.uPxK, rh/(2*tanH));
     gl.uniform1i(pu.uN, 1); gl.uniform1i(pu.uH, 0);
     gl.bindVertexArray(pVAO);
-    gl.drawArrays(gl.POINTS, 0, P.n);
+    gl.drawArrays(gl.POINTS, 0, o/6);
     gl.depthMask(true);
   }
   gl.disable(gl.DEPTH_TEST);
@@ -2221,22 +2471,19 @@ function drawUI(){
     txt(act ? 'actif' : (th && th.stopped ? 'silencieux' : 'au repos'), ix + 9*u, iy + 8*u, 8*u, act ? C_ORANGE : C_CREAM, MONO, 'left', playA*(act ? pulse : 0.45));
     // hints strip
     let hint;
-    if (pl.state === 'ride' || pl.state === 'mounting') hint = isTouch ? 'joystick : diriger · SAUT : sauter du ver · VUE : changer de vue'
+    if (pl.state === 'ride' || pl.state === 'hooking') hint = isTouch ? 'joystick : diriger · SAUT : sauter du ver · VUE : changer de vue'
       : 'Q D / A D : diriger  ·  Z W : accélérer  ·  ESPACE : sauter du ver  ·  TAB : vue';
-    else hint = isTouch ? 'joystick : marcher (loin : courir) · E : marteleur · SAUT · VUE · glisser : regarder'
-      : 'ZQSD / WASD : marcher  ·  MAJ : courir  ·  E : planter le marteleur  ·  ESPACE : sauter  ·  TAB : vue  ·  souris : regarder';
+    else hint = isTouch ? 'joystick : marcher (loin : courir) · E : marteleur / crochets · SAUT · VUE · glisser : regarder'
+      : 'ZQSD / WASD : marcher  ·  MAJ : courir  ·  E : marteleur / crochets  ·  ESPACE : sauter  ·  TAB : vue  ·  souris : regarder';
     let hs = 8*u;
     c.font = hs + 'px ' + MONO;
     const hw = c.measureText(hint).width;
     if (hw > W*0.94) hs = Math.max(6, Math.floor(hs*W*0.94/hw));
     txt(hint, W/2, isTouch ? 40*u : H - 14*u, hs, C_CREAM, MONO, 'center', playA*0.55);
     // mount prompt
-    if (mw){
-      const k = 1 - mw.t/mw.dur;
-      const py = H*0.62;
-      txt(isTouch ? 'E  ·  s’agripper' : '[E]  s’agripper', W/2, py, 11*u, C_CREAM, PIX, 'center', 0.95);
-      c.fillStyle = C_INK; c.fillRect(W/2 - 40*u, py + 10*u, 80*u, 3*u);
-      c.fillStyle = C_ORANGE; c.fillRect(W/2 - 40*u + u, py + 10*u + u, Math.max(0, Math.floor(78*k))*u, u);
+    if (hookTarget >= 0){
+      const py = H*0.62, pulse = 0.75 + 0.25*Math.sin(rtime*8);
+      txt(isTouch ? 'E  ·  lancer les crochets' : '[E]  lancer les crochets', W/2, py, 11*u, C_CREAM, PIX, 'center', 0.95*pulse);
     }
     if (msg){
       const a = clamp(Math.min(msg.t/0.4, (msg.dur - msg.t)/0.8), 0, 1);
@@ -2254,12 +2501,12 @@ function drawTouch(u, a){
   c.fillStyle = C_CREAM; c.beginPath(); c.arc(jx + touch.kx*40*u, jy + touch.ky*40*u, 16*u, 0, 6.283); c.fill();
   c.globalAlpha = 1;
   const btns = [['act', 'E', W - 70*u, H - 120*u], ['jump', 'SAUT', W - 140*u, H - 60*u], ['view', 'VUE', W - 60*u, H - 46*u]];
-  if (mw) btns[0][1] = 'E !';
+  if (hookTarget >= 0) btns[0][1] = 'E !';
   for (const [k, l, x, y] of btns){
     const r = 26*u;
     uiRects[k] = [x - r, y - r, 2*r, 2*r];
     c.globalAlpha = (keys[k] ? 0.6 : 0.32)*a;
-    c.fillStyle = k === 'act' && mw ? C_ORANGE : C_INK; c.beginPath(); c.arc(x, y, r, 0, 6.283); c.fill();
+    c.fillStyle = k === 'act' && hookTarget >= 0 ? C_ORANGE : C_INK; c.beginPath(); c.arc(x, y, r, 0, 6.283); c.fill();
     c.strokeStyle = C_CREAM; c.lineWidth = 2*u; c.stroke();
     c.globalAlpha = 1;
     txt(l, x, y, 9*u, C_CREAM, PIX, 'center', 0.85*a);
@@ -2374,7 +2621,7 @@ if (TEST){
     get ready(){ return state !== 'loading'; },
     get state(){ return state; }, set state(v){ state = v; },
     pl, cam, keys, touch,
-    get th(){ return th; }, get worm(){ return worm; }, get mw(){ return mw; },
+    get th(){ return th; }, get worm(){ return worm; }, get hookTarget(){ return hookTarget; },
     get time(){ return time; }, get P(){ return P.n; },
     start(){ startGame(); titleBlend = 0; },
     press(a){ onPress(a); },
@@ -2391,7 +2638,7 @@ if (TEST){
       for (let i = 0; i < P.n; i++){ v.push(P.x[i], P.y[i]); }
       return v.every(Number.isFinite);
     },
-    get mwOpen(){ return !!mw; },
+    thumperMode,
     get pr(){ return { rw, rh, pixScale }; },
   };
 }
